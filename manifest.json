@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/HANCORE-linux/omarchy-plugin-marketplace/main/schema/plugin-manifest.v1.json",
+  "schemaVersion": 1,
+  "id": "kiryuuki.oma-chroma",
+  "name": "OmaChroma",
+  "version": "1.0.0",
+  "author": "Kiryuuki",
+  "license": "Source-Available Non-Commercial (PolyForm-Noncommercial-1.0.0)",
+  "description": "Desktop themes and cursor manager, downloader, and randomizer for Omarchy Quattro. Supports dark/light mode filtering, theme and cursor checklists for randomizing, and custom Git repositories as sources.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaChroma",
+    "description": "Themes & Cursors Hub, Downloader, and Randomizer",
+    "category": "Appearance",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "settings": {
+    "cursorSize": {
+      "type": "number",
+      "default": 24,
+      "description": "Default cursor size in pixels"
+    },
+    "randomizeIntervalMin": {
+      "type": "number",
+      "default": 0,
+      "description": "Automatic randomizer interval in minutes (0 to disable)"
+    }
+  }
+}
