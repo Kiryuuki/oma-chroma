@@ -772,9 +772,43 @@ def remove_item(item_type, item_id):
         return False, str(e)
 
 
-def install_theme_repo(url):
+def install_theme_repo(url, theme_meta=None):
     try:
         url = url.strip()
+        if not url:
+            return False, "Theme URL or metadata cannot be empty"
+
+        # Check if this is a direct bjarneo / cdn theme or regular git repo
+        if theme_meta and theme_meta.get("isCdnTheme") and theme_meta.get("colorsTomlUrl"):
+            theme_id = theme_meta.get("id", "custom-theme")
+            target_dir = Path.home() / ".config" / "omarchy" / "themes" / theme_id
+            if target_dir.exists():
+                return False, f"Theme directory {theme_id} already exists."
+            
+            target_dir.mkdir(parents=True, exist_ok=True)
+            bg_dir = target_dir / "backgrounds"
+            bg_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download colors.toml
+            colors_url = theme_meta.get("colorsTomlUrl")
+            req = urllib.request.Request(colors_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp, open(target_dir / "colors.toml", "wb") as f:
+                f.write(resp.read())
+
+            # Download wallpaper
+            wp_url = theme_meta.get("remoteUrl") or theme_meta.get("wallpaperUrl")
+            if wp_url and wp_url.startswith("http"):
+                req2 = urllib.request.Request(wp_url, headers={"User-Agent": "Mozilla/5.0"})
+                wp_ext = wp_url.split(".")[-1].split("?")[0]
+                if wp_ext not in ("jpg", "jpeg", "png", "webp"):
+                    wp_ext = "jpg"
+                wp_file = bg_dir / f"01-wallpaper.{wp_ext}"
+                with urllib.request.urlopen(req2, timeout=25) as resp, open(wp_file, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+                shutil.copy(wp_file, target_dir / f"preview.{wp_ext}")
+
+            return True, f"Theme {theme_id} installed successfully from Bjarneo CDN."
+
         if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("git@"):
             return False, "Invalid repository URL format"
 
@@ -969,6 +1003,7 @@ def main():
     parser.add_argument("--next-wallpaper", action="store_true", help="Cycle next wallpaper")
     parser.add_argument("--randomize", choices=["combo", "theme", "cursor", "wallpaper"], help="Randomize styling")
     parser.add_argument("--install-theme", type=str, help="Install theme git URL")
+    parser.add_argument("--install-theme-json", type=str, help="Install theme JSON metadata payload")
     parser.add_argument("--install-cursor", type=str, help="Download & install cursor archive URL")
     parser.add_argument("--remove-item", nargs=2, metavar=("TYPE", "ID"), help="Remove user theme or cursor")
     parser.add_argument("--restart-shell", action="store_true", help="Restart Omarchy shell")
@@ -1083,6 +1118,14 @@ def main():
         ok, msg = remove_item(args.remove_item[0], args.remove_item[1])
         poll_status()
         print(json.dumps({"ok": ok, "message": msg}))
+    elif args.install_theme_json:
+        try:
+            meta = json.loads(args.install_theme_json)
+            ok, msg = install_theme_repo(meta.get("url", ""), theme_meta=meta)
+            poll_status()
+            print(json.dumps({"ok": ok, "message": msg}))
+        except Exception as e:
+            print(json.dumps({"ok": False, "message": str(e)}))
     elif args.install_theme:
         ok, msg = install_theme_repo(args.install_theme)
         poll_status()

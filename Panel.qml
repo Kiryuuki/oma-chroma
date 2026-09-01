@@ -46,6 +46,17 @@ Panel {
   property int storePage: 0
   readonly property int itemsPerPage: 10
   
+  property string themeSearchQuery: ""
+  readonly property var filteredThemeSources: {
+    var query = root.themeSearchQuery.trim().toLowerCase()
+    if (!query) return root.themeSourcesList
+    return root.themeSourcesList.filter(function(item) {
+      return (item.name && item.name.toLowerCase().indexOf(query) !== -1) ||
+             (item.author && item.author.toLowerCase().indexOf(query) !== -1) ||
+             (item.description && item.description.toLowerCase().indexOf(query) !== -1) ||
+             (item.category && item.category.toLowerCase().indexOf(query) !== -1)
+    })
+  }
   property string statusNotice: ""
   property string activeActionId: ""
   property bool isActionRunning: false
@@ -81,10 +92,10 @@ Panel {
     return root.visibleCursors.slice(s, s + root.itemsPerPage)
   }
 
-  readonly property int totalStorePages: Math.max(1, Math.ceil(root.themeSourcesList.length / root.itemsPerPage))
+  readonly property int totalStorePages: Math.max(1, Math.ceil(root.filteredThemeSources.length / root.itemsPerPage))
   readonly property var pagedThemeSources: {
     var s = root.storePage * root.itemsPerPage
-    return root.themeSourcesList.slice(s, s + root.itemsPerPage)
+    return root.filteredThemeSources.slice(s, s + root.itemsPerPage)
   }
 
   function open() { refresh(); root.controller.show() }
@@ -199,12 +210,21 @@ function triggerRandomize(mode) {
     root.activeActionId = "dl:" + item.id
     root.statusNotice = "Downloading " + item.name + "..."
     noticeTimer.restart()
-    actionProcess.command = [
-      "/usr/bin/python3",
-      (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/kiryuuki.oma-chroma/scripts/chroma_engine.py",
-      "--install-theme",
-      item.url
-    ]
+    if (item.isCdnTheme) {
+      actionProcess.command = [
+        "/usr/bin/python3",
+        (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/kiryuuki.oma-chroma/scripts/chroma_engine.py",
+        "--install-theme-json",
+        JSON.stringify(item)
+      ]
+    } else {
+      actionProcess.command = [
+        "/usr/bin/python3",
+        (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/kiryuuki.oma-chroma/scripts/chroma_engine.py",
+        "--install-theme",
+        item.url
+      ]
+    }
     actionProcess.running = true
   }
 
@@ -444,7 +464,7 @@ function triggerRandomize(mode) {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: customHoursInput.activeFocus || sourceNameInput.activeFocus || sourceUrlInput.activeFocus || cursorSourceNameInput.activeFocus || cursorSourceUrlInput.activeFocus
+      blocked: themeSearchInput.activeFocus || customHoursInput.activeFocus || sourceNameInput.activeFocus || sourceUrlInput.activeFocus || cursorSourceNameInput.activeFocus || cursorSourceUrlInput.activeFocus
       onCloseRequested: root.close()
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) {
@@ -1855,17 +1875,84 @@ function triggerRandomize(mode) {
               }
             }
 
-            // Pagination Controls Header
+            // Search & Pagination Controls Header
             RowLayout {
               width: mainColumn.innerWidth
+              spacing: Style.space(8)
 
               Text {
                 textFormat: Text.PlainText
-                text: "COMMUNITY THEMES STORE (PAGE " + (root.storePage + 1) + " OF " + root.totalStorePages + " · " + root.themeSourcesList.length + " TOTAL)"
+                text: "COMMUNITY THEMES STORE (" + (root.themeSearchQuery ? (root.filteredThemeSources.length + " MATCHES") : (root.themeSourcesList.length + " TOTAL")) + " · PAGE " + (root.storePage + 1) + "/" + root.totalStorePages + ")"
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 color: root.contentSubtle
+              }
+
+              Item { Layout.fillWidth: true }
+
+              // Live Theme Search Input Field
+              Rectangle {
+                implicitWidth: Style.space(220)
+                height: Style.space(26)
+                radius: Style.cornerRadius
+                color: Qt.rgba(0,0,0,0.3)
+                border.width: 1
+                border.color: themeSearchInput.activeFocus ? Color.accent : Qt.darker(root.contentForeground, 2.6)
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.margins: 4
+                  spacing: 4
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "󰍉"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 11
+                    color: themeSearchInput.activeFocus ? Color.accent : root.contentSubtle
+                  }
+
+                  TextInput {
+                    id: themeSearchInput
+                    Layout.fillWidth: true
+                    clip: true
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 10
+                    text: root.themeSearchQuery
+                    onTextChanged: {
+                      root.themeSearchQuery = text
+                      root.storePage = 0
+                    }
+
+                    Text {
+                      anchors.fill: parent
+                      textFormat: Text.PlainText
+                      text: "Search themes..."
+                      color: root.contentSubtle
+                      visible: !themeSearchInput.text && !themeSearchInput.activeFocus
+                    }
+                  }
+
+                  Text {
+                    visible: root.themeSearchQuery.length > 0
+                    textFormat: Text.PlainText
+                    text: "󰅖"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 10
+                    color: root.contentSubtle
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: {
+                        root.themeSearchQuery = ""
+                        root.storePage = 0
+                      }
+                    }
+                  }
+                }
               }
 
               Item { Layout.fillWidth: true }
