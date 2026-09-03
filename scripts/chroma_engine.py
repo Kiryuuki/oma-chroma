@@ -33,6 +33,8 @@ CONFIG_FILE = STATE_DIR / "config.json"
 CACHE_DIR = Path.home() / ".cache" / "omarchy-chroma"
 THUMBNAIL_DIR = CACHE_DIR / "thumbnails"
 ONLINE_THEMES_CACHE = CACHE_DIR / "online_themes.json"
+WALLPAPERS_CACHE_FILE = CACHE_DIR / "wallpapers_cache.json"
+WALLPAPERS_JS_URL = "https://bjarneo.github.io/omarchy-themes/wallpapers.js"
 MAX_STATE_BYTES = 5 * 1024 * 1024  # 5 MB
 CACHE_TTL = 24 * 3600  # 24 hours
 
@@ -243,19 +245,141 @@ CURATED_CURSOR_SOURCES = [
 ]
 
 
-def load_unique_cdn_wallpapers():
-    cache_f = Path("/tmp/bjarneo_unique_wallpapers.json")
-    if cache_f.exists():
+def fetch_and_parse_wallpapers_cached():
+    """
+    Fetches and parses the official wallpaper catalog from https://bjarneo.github.io/omarchy-themes/wallpapers.js
+    
+    Source Architecture & Parser Note:
+    The file wallpapers.js is served as static JavaScript (text/plain) rather than raw JSON.
+    It begins with `window.WALLPAPERS_BASE_URL = "..."` followed by `window.WALLPAPERS = { ... };`
+    and contains trailing JavaScript execution code.
+    A naive regex with matching braces will fail due to trailing script tokens.
+    Therefore, this function uses a character-by-character brace-depth counter with quote and
+    escape tracking to isolate the exact JSON object slice before parsing.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Check existing daily cache
+    if WALLPAPERS_CACHE_FILE.exists():
         try:
-            with open(cache_f, "r") as f:
-                arr = json.load(f)
-                if arr and len(arr) > 100:
-                    return arr
+            mtime = WALLPAPERS_CACHE_FILE.stat().st_mtime
+            if (time.time() - mtime) < CACHE_TTL:
+                with open(WALLPAPERS_CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_doc = json.load(f)
+                    if cached_doc and isinstance(cached_doc.get("items"), list) and len(cached_doc["items"]) > 1000:
+                        return cached_doc
         except Exception:
             pass
-    return [
-        "https://wallpapers.hel1.your-objectstorage.com/dark/blue/10667x6000_omarchy_glass-sphere__01-glass-sphere.jpg"
-    ]
+
+    # 2. Fetch live data from upstream CDN
+    try:
+        req = urllib.request.Request(WALLPAPERS_JS_URL, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+        with urllib.request.urlopen(req, timeout=20.0) as resp:
+            raw_text = resp.read().decode("utf-8")
+
+        # Extract WALLPAPERS_BASE_URL via regex
+        m = re.search(r'window\.WALLPAPERS_BASE_URL\s*=\s*"([^"]+)"', raw_text)
+        if not m:
+            raise ValueError("Could not extract window.WALLPAPERS_BASE_URL from wallpapers.js")
+        base_url = m.group(1).rstrip("/")
+
+        # Locate window.WALLPAPERS = { start
+        target_token = "window.WALLPAPERS = {"
+        start_idx = raw_text.find(target_token)
+        if start_idx == -1:
+            raise ValueError("Could not find window.WALLPAPERS object in wallpapers.js")
+
+        brace_start = start_idx + len("window.WALLPAPERS = ")
+        depth = 0
+        in_string = False
+        escape = False
+        end_idx = -1
+
+        for idx in range(brace_start, len(raw_text)):
+            char = raw_text[idx]
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if char == '{':
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = idx + 1
+                        break
+
+        if end_idx == -1:
+            raise ValueError("Could not find matching closing brace for window.WALLPAPERS")
+
+        json_slice = raw_text[brace_start:end_idx]
+        parsed_map = json.loads(json_slice)
+        del raw_text
+        del json_slice
+
+        items = []
+        for rel_path, meta in parsed_map.items():
+            if not rel_path:
+                continue
+            color = meta.get("color", "default")
+            colors = meta.get("colors", [])
+            full_url = f"{base_url}/{rel_path}"
+
+            filename = rel_path.split("/")[-1]
+            raw_name = filename.split(".")[0].replace("_", " ").replace("-", " ")
+            clean_name = re.sub(r"^\d+x\d+\s+", "", raw_name)
+            clean_name = " ".join(w.capitalize() for w in clean_name.split() if w)
+            category = rel_path.split("/")[0].capitalize() if "/" in rel_path else "Curated"
+
+            items.append({
+                "path": rel_path,
+                "name": clean_name or filename,
+                "color": color,
+                "colors": colors[:8] if isinstance(colors, list) else [],
+                "url": full_url,
+                "category": category
+            })
+
+        cached_doc = {
+            "updatedAt": int(time.time()),
+            "baseUrl": base_url,
+            "count": len(items),
+            "items": items
+        }
+        write_atomic(WALLPAPERS_CACHE_FILE, cached_doc)
+        print(f"[OmaChroma] Successfully parsed & cached {len(items)} wallpapers from wallpapers.js")
+        return cached_doc
+    except Exception as e:
+        print(f"[OmaChroma] Error fetching/parsing wallpapers.js: {e}", file=sys.stderr)
+        # Fail gracefully: fallback to last-known-good cache if available
+        if WALLPAPERS_CACHE_FILE.exists():
+            try:
+                with open(WALLPAPERS_CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {
+            "updatedAt": 0,
+            "baseUrl": "https://wallpapers.hel1.your-objectstorage.com",
+            "count": 0,
+            "items": []
+        }
+
+
+def load_curated_wallpapers():
+    doc = fetch_and_parse_wallpapers_cached()
+    items = doc.get("items", [])
+    if not items:
+        return [
+            "https://wallpapers.hel1.your-objectstorage.com/dark/blue/10667x6000_omarchy_glass-sphere__01-glass-sphere.jpg"
+        ]
+    return [it["url"] for it in items]
 
 
 def get_cached_thumbnail_path(remote_url):
@@ -505,7 +629,20 @@ def scan_cursors():
 
 def build_full_community_catalog():
     catalog = []
-    unique_cdn = load_unique_cdn_wallpapers()
+    wp_doc = fetch_and_parse_wallpapers_cached()
+    all_wp_items = wp_doc.get("items", [])
+    
+    # Page 1 display curation: combination of latest wallpapers and a random set
+    # Using 5 latest entries and 5 randomly distributed entries for the first 10 themes
+    page1_wp_pool = []
+    if len(all_wp_items) >= 20:
+        latest_slice = all_wp_items[-5:]
+        rng = random.Random(42) # Deterministic seed for stable daily layout
+        random_slice = rng.sample(all_wp_items[:-5], 5)
+        # Interleave latest and random
+        for i in range(5):
+            page1_wp_pool.append(latest_slice[4 - i]["url"])
+            page1_wp_pool.append(random_slice[i]["url"])
     
     for idx, (raw_id, url, desc, cat) in enumerate(RAW_COMMUNITY_THEMES):
         clean_name = " ".join(w.capitalize() for w in raw_id.replace("omarchy-", "").replace("-theme", "").replace(".theme", "").replace("-", " ").replace("/", " ").split())
@@ -514,8 +651,12 @@ def build_full_community_catalog():
         
         if slug in REPO_BACKGROUND_MAP:
             wp_url = REPO_BACKGROUND_MAP[slug]
+        elif idx < len(page1_wp_pool):
+            wp_url = page1_wp_pool[idx]
+        elif all_wp_items:
+            wp_url = all_wp_items[(idx * 19 + 7) % len(all_wp_items)]["url"]
         else:
-            wp_url = unique_cdn[(idx * 17) % len(unique_cdn)]
+            wp_url = "https://wallpapers.hel1.your-objectstorage.com/dark/blue/10667x6000_omarchy_glass-sphere__01-glass-sphere.jpg"
         
         local_thumb = get_cached_thumbnail_path(wp_url)
         
@@ -541,7 +682,7 @@ def build_full_community_catalog():
         c_id = "custom-" + hashlib.md5(c_url.encode()).hexdigest()[:8]
         slug = c_url.replace("https://github.com/", "").strip("/")
         author = slug.split("/")[0] if "/" in slug else "custom"
-        wp_url = src.get("wallpaperUrl") or unique_cdn[(idx * 31 + 7) % len(unique_cdn)]
+        wp_url = src.get("wallpaperUrl") or (all_wp_items[(idx * 31 + 13) % len(all_wp_items)]["url"] if all_wp_items else "https://wallpapers.hel1.your-objectstorage.com/dark/blue/10667x6000_omarchy_glass-sphere__01-glass-sphere.jpg")
         local_thumb = get_cached_thumbnail_path(wp_url)
 
         catalog.insert(0, {
@@ -996,6 +1137,7 @@ def randomize(mode="combo"):
 def main():
     parser = argparse.ArgumentParser(description="OmaChroma Engine")
     parser.add_argument("--poll", action="store_true", help="Scan and write status.json")
+    parser.add_argument("--sync-wallpapers", action="store_true", help="Force fetch and parse wallpapers.js catalog")
     parser.add_argument("--set-theme", type=str, help="Apply theme by name")
     parser.add_argument("--set-cursor", type=str, help="Apply cursor theme by id")
     parser.add_argument("--cursor-size", type=int, default=24, help="Cursor size")
@@ -1021,7 +1163,10 @@ def main():
     parser.add_argument("--save-config", action="store_true", help="Save config JSON from stdin")
     args = parser.parse_args()
 
-    if args.set_timer is not None:
+    if args.sync_wallpapers:
+        doc = fetch_and_parse_wallpapers_cached()
+        print(json.dumps({"ok": True, "count": doc.get("count", 0), "baseUrl": doc.get("baseUrl", "")}))
+    elif args.set_timer is not None:
         ok, msg = set_randomizer_timer(args.set_timer)
         poll_status()
         print(json.dumps({"ok": ok, "message": msg}))
