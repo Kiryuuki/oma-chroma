@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "kiryuuki.oma-chroma",
   "name": "OmaChroma",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Kiryuuki",
   "license": "Source-Available Non-Commercial (PolyForm-Noncommercial-1.0.0)",
   "description": "Desktop themes and cursor manager, downloader, and randomizer for Omarchy Quattro. Supports dark/light mode filtering, theme and cursor checklists for randomizing, and custom Git repositories as sources.",
