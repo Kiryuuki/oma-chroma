@@ -36,7 +36,7 @@ Panel {
     cursorSources: []
   })
 
-  // 0: Themes, 1: Cursors, 2: Randomizer, 3: Themes Store, 4: Cursors Store, 5: Installed
+  // 0: Themes, 1: Cursors, 2: Randomizer, 3: Themes Store, 4: Cursors Store, 5: Installed, 6: Wallpapers
   property int activeTab: 2
   property int selectedIndex: 0
   
@@ -44,9 +44,11 @@ Panel {
   property int themePage: 0
   property int cursorPage: 0
   property int storePage: 0
+  property int wallpaperPage: 0
   readonly property int itemsPerPage: 10
   
   property string themeSearchQuery: ""
+  property string wallpaperSearchQuery: ""
   readonly property var filteredThemeSources: {
     var query = root.themeSearchQuery.trim().toLowerCase()
     if (!query) return root.themeSourcesList
@@ -55,6 +57,16 @@ Panel {
              (item.author && item.author.toLowerCase().indexOf(query) !== -1) ||
              (item.description && item.description.toLowerCase().indexOf(query) !== -1) ||
              (item.category && item.category.toLowerCase().indexOf(query) !== -1)
+    })
+  }
+  readonly property var filteredWallpaperSources: {
+    var query = root.wallpaperSearchQuery.trim().toLowerCase()
+    if (!query) return root.wallpaperSourcesList
+    return root.wallpaperSourcesList.filter(function(item) {
+      return (item.name && item.name.toLowerCase().indexOf(query) !== -1) ||
+             (item.color && item.color.toLowerCase().indexOf(query) !== -1) ||
+             (item.category && item.category.toLowerCase().indexOf(query) !== -1) ||
+             (item.description && item.description.toLowerCase().indexOf(query) !== -1)
     })
   }
   property string statusNotice: ""
@@ -78,6 +90,7 @@ Panel {
   readonly property var themeSourcesList: (root.chromaData && root.chromaData.themeSources) ? root.chromaData.themeSources : []
   readonly property var cursorSourcesList: (root.chromaData && root.chromaData.cursorSources) ? root.chromaData.cursorSources : []
   readonly property var customSourcesList: (root.chromaData && root.chromaData.customSources) ? root.chromaData.customSources : []
+  readonly property var wallpaperSourcesList: (root.chromaData && root.chromaData.wallpaperSources) ? root.chromaData.wallpaperSources : []
 
   // Calculated pagination slices
   readonly property int totalThemePages: Math.max(1, Math.ceil(root.visibleThemes.length / root.itemsPerPage))
@@ -96,6 +109,12 @@ Panel {
   readonly property var pagedThemeSources: {
     var s = root.storePage * root.itemsPerPage
     return root.filteredThemeSources.slice(s, s + root.itemsPerPage)
+  }
+
+  readonly property int totalWallpaperPages: Math.max(1, Math.ceil(root.filteredWallpaperSources.length / root.itemsPerPage))
+  readonly property var pagedWallpaperSources: {
+    var s = root.wallpaperPage * root.itemsPerPage
+    return root.filteredWallpaperSources.slice(s, s + root.itemsPerPage)
   }
 
   function open() { refresh(); root.controller.show() }
@@ -255,6 +274,30 @@ function triggerRandomize(mode) {
       "--remove-item",
       type,
       id
+    ]
+    actionProcess.running = true
+  }
+
+  function downloadWallpaperTheme(item) {
+    if (!item || root.isActionRunning) return
+    root.isActionRunning = true
+    root.activeActionId = "wp:" + item.id
+    root.statusNotice = "Installing " + item.name + "..."
+    noticeTimer.restart()
+    actionProcess.command = [
+      "/usr/bin/python3",
+      (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/kiryuuki.oma-chroma/scripts/chroma_engine.py",
+      "--install-wallpaper-theme",
+      JSON.stringify({
+        "id": item.id,
+        "path": item.path,
+        "name": item.name,
+        "url": item.url,
+        "color": item.color,
+        "colors": item.colors,
+        "remoteUrl": item.remoteUrl || item.url,
+        "wallpaperUrl": item.wallpaperUrl || item.url
+      })
     ]
     actionProcess.running = true
   }
@@ -464,11 +507,13 @@ function triggerRandomize(mode) {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: themeSearchInput.activeFocus || customHoursInput.activeFocus || sourceNameInput.activeFocus || sourceUrlInput.activeFocus || cursorSourceNameInput.activeFocus || cursorSourceUrlInput.activeFocus
+      blocked: themeSearchInput.activeFocus || customHoursInput.activeFocus || sourceNameInput.activeFocus || sourceUrlInput.activeFocus || cursorSourceNameInput.activeFocus || cursorSourceUrlInput.activeFocus || wallpaperSearchInput.activeFocus
       onCloseRequested: root.close()
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) {
-          var count = (root.activeTab === 0) ? root.pagedThemes.length : ((root.activeTab === 1) ? root.pagedCursors.length : 0)
+          var count = (root.activeTab === 0) ? root.pagedThemes.length :
+                      ((root.activeTab === 1) ? root.pagedCursors.length :
+                      ((root.activeTab === 6) ? root.pagedWallpaperSources.length : 0))
           if (count > 0) {
             root.selectedIndex = Math.max(0, Math.min(count - 1, root.selectedIndex + dy))
           }
@@ -479,6 +524,8 @@ function triggerRandomize(mode) {
           root.applyTheme(root.pagedThemes[root.selectedIndex].name)
         } else if (root.activeTab === 1 && root.pagedCursors[root.selectedIndex]) {
           root.applyCursor(root.pagedCursors[root.selectedIndex].id)
+        } else if (root.activeTab === 6 && root.pagedWallpaperSources[root.selectedIndex]) {
+          root.downloadWallpaperTheme(root.pagedWallpaperSources[root.selectedIndex])
         }
       }
       onReturnRequested: onActivateRequested()
@@ -490,6 +537,7 @@ function triggerRandomize(mode) {
         else if (t === "4") { root.activeTab = 3; root.selectedIndex = 0 }
         else if (t === "5") { root.activeTab = 4; root.selectedIndex = 0 }
         else if (t === "6") { root.activeTab = 5; root.selectedIndex = 0 }
+        else if (t === "7") { root.activeTab = 6; root.selectedIndex = 0 }
         else if (t === "t" || t === "T") root.triggerRandomize("theme")
         else if (t === "c" || t === "C") root.triggerRandomize("cursor")
         else if (t === "w" || t === "W") root.nextWallpaper()
@@ -498,11 +546,13 @@ function triggerRandomize(mode) {
           if (root.activeTab === 0 && root.themePage < root.totalThemePages - 1) root.themePage++
           else if (root.activeTab === 1 && root.cursorPage < root.totalCursorPages - 1) root.cursorPage++
           else if (root.activeTab === 3 && root.storePage < root.totalStorePages - 1) root.storePage++
+          else if (root.activeTab === 6 && root.wallpaperPage < root.totalWallpaperPages - 1) root.wallpaperPage++
         }
         else if (t === "p" || t === "P" || t === "[" || t === "<") {
           if (root.activeTab === 0 && root.themePage > 0) root.themePage--
           else if (root.activeTab === 1 && root.cursorPage > 0) root.cursorPage--
           else if (root.activeTab === 3 && root.storePage > 0) root.storePage--
+          else if (root.activeTab === 6 && root.wallpaperPage > 0) root.wallpaperPage--
         }
       }
 
@@ -671,14 +721,15 @@ function triggerRandomize(mode) {
                 { id: 2, name: "Randomizer", icon: "󰒝" },
                 { id: 3, name: "Themes Store (" + root.themeSourcesList.length + ")", icon: "󰔎" },
                 { id: 4, name: "Cursors Store (" + root.cursorSourcesList.length + ")", icon: "󰍛" },
-                { id: 5, name: "Installed (" + root.userInstalledList.length + ")", icon: "󰉍" }
+                { id: 5, name: "Installed (" + root.userInstalledList.length + ")", icon: "󰉍" },
+                { id: 6, name: "Wallpapers (" + root.wallpaperSourcesList.length + ")", icon: "󰸉" }
               ]
 
               delegate: BorderSurface {
                 required property var modelData
                 readonly property bool isCurrent: root.activeTab === modelData.id
 
-                implicitWidth: (mainColumn.innerWidth - (Style.space(6) * 5)) / 6
+                implicitWidth: (mainColumn.innerWidth - (Style.space(6) * 6)) / 7
                 implicitHeight: Style.space(32)
                 radius: Style.cornerRadius
                 color: isCurrent ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.22) : Style.hoverFillFor(root.contentForeground, root.contentForeground)
@@ -1916,10 +1967,9 @@ function triggerRandomize(mode) {
                   TextInput {
                     id: themeSearchInput
                     Layout.fillWidth: true
-                    clip: true
                     color: root.contentForeground
                     font.family: root.contentFontFamily
-                    font.pixelSize: 10
+                    font.pixelSize: 9
                     text: root.themeSearchQuery
                     onTextChanged: {
                       root.themeSearchQuery = text
@@ -2652,6 +2702,325 @@ function triggerRandomize(mode) {
                       cursorShape: Qt.PointingHandCursor
                       onClicked: root.removeItem(modelData.type, modelData.id)
                     }
+                  }
+                }
+              }
+            }
+          }
+
+          // --- TAB 6: WALLPAPERS (3000+ palette themes) ---
+          Column {
+            width: mainColumn.innerWidth
+            spacing: Style.space(10)
+            visible: root.activeTab === 6
+
+            // Search & Pagination Controls Header
+            RowLayout {
+              width: mainColumn.innerWidth
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "WALLPAPER THEMES (" + (root.wallpaperSearchQuery ? (root.filteredWallpaperSources.length + " MATCHES") : (root.wallpaperSourcesList.length + " TOTAL")) + " · PAGE " + (root.wallpaperPage + 1) + "/" + root.totalWallpaperPages + ")"
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                color: root.contentSubtle
+                elide: Text.ElideRight
+                maximumLineCount: 1
+              }
+
+              Item { Layout.fillWidth: true }
+
+              // Live Wallpaper Search Input Field
+              Rectangle {
+                implicitWidth: Style.space(220)
+                height: Style.space(26)
+                radius: Style.cornerRadius
+                color: Qt.rgba(0,0,0,0.3)
+                border.width: 1
+                border.color: wallpaperSearchInput.activeFocus ? Color.accent : Qt.darker(root.contentForeground, 2.6)
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.margins: 4
+                  spacing: 4
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "󰍉"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 11
+                    color: wallpaperSearchInput.activeFocus ? Color.accent : root.contentSubtle
+                  }
+
+                  TextInput {
+                    id: wallpaperSearchInput
+                    Layout.fillWidth: true
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 9
+                    text: root.wallpaperSearchQuery
+                    onTextChanged: function() {
+                      root.wallpaperSearchQuery = text
+                      root.wallpaperPage = 0
+                    }
+
+                    Text {
+                      anchors.fill: parent
+                      textFormat: Text.PlainText
+                      text: "Search wallpapers..."
+                      color: root.contentSubtle
+                      visible: !wallpaperSearchInput.text && !wallpaperSearchInput.activeFocus
+                    }
+                  }
+
+                  Text {
+                    visible: root.wallpaperSearchQuery.length > 0
+                    textFormat: Text.PlainText
+                    text: "󰅖"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 10
+                    color: root.contentSubtle
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: {
+                        root.wallpaperSearchQuery = ""
+                        root.wallpaperPage = 0
+                      }
+                    }
+                  }
+                }
+              }
+
+              Item { Layout.fillWidth: true }
+
+              Row {
+                spacing: Style.space(6)
+
+                // Prev Page Button
+                BorderSurface {
+                  implicitWidth: Style.space(80)
+                  implicitHeight: Style.space(26)
+                  radius: Style.cornerRadius
+                  color: (root.wallpaperPage > 0) ? (prevWpMouse.pressed ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.3) : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)) : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.04)
+                  borderSpec: Border.controlSpec("normal", (root.wallpaperPage > 0) ? Color.accent : Qt.darker(root.contentForeground, 3.0), Color.accent)
+
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: "◀ Prev (p)"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 10
+                    font.bold: true
+                    color: (root.wallpaperPage > 0) ? Color.accent : root.contentSubtle
+                  }
+
+                  MouseArea {
+                    id: prevWpMouse
+                    anchors.fill: parent
+                    hoverEnabled: root.wallpaperPage > 0
+                    cursorShape: (root.wallpaperPage > 0) ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: {
+                      if (root.wallpaperPage > 0) {
+                        root.wallpaperPage--
+                        root.selectedIndex = 0
+                      }
+                    }
+                  }
+                }
+
+                // Next Page Button
+                BorderSurface {
+                  implicitWidth: Style.space(80)
+                  implicitHeight: Style.space(26)
+                  radius: Style.cornerRadius
+                  color: (root.wallpaperPage < root.totalWallpaperPages - 1) ? (nextWpMouse.pressed ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.3) : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)) : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.04)
+                  borderSpec: Border.controlSpec("normal", (root.wallpaperPage < root.totalWallpaperPages - 1) ? Color.accent : Qt.darker(root.contentForeground, 3.0), Color.accent)
+
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: "Next (n) ▶"
+                    font.family: root.contentFontFamily
+                    font.pixelSize: 10
+                    font.bold: true
+                    color: (root.wallpaperPage < root.totalWallpaperPages - 1) ? Color.accent : root.contentSubtle
+                  }
+
+                  MouseArea {
+                    id: nextWpMouse
+                    anchors.fill: parent
+                    hoverEnabled: root.wallpaperPage < root.totalWallpaperPages - 1
+                    cursorShape: (root.wallpaperPage < root.totalWallpaperPages - 1) ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: {
+                      if (root.wallpaperPage < root.totalWallpaperPages - 1) {
+                        root.wallpaperPage++
+                        root.selectedIndex = 0
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            // Wallpaper grid
+            GridLayout {
+              width: mainColumn.innerWidth
+              columns: 2
+              rowSpacing: Style.space(8)
+              columnSpacing: Style.space(8)
+
+              Repeater {
+                model: root.pagedWallpaperSources
+
+                delegate: BorderSurface {
+                  required property var modelData
+                  required property int index
+                  readonly property bool isInstalled: modelData.installed
+                  readonly property bool isBusy: root.isActionRunning && root.activeActionId === ("wp:" + modelData.id)
+
+                  Layout.fillWidth: true
+                  implicitHeight: Style.space(104)
+                  radius: Style.cornerRadius
+                  color: isInstalled
+                    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.15)
+                    : (cardMouse.containsMouse ? Style.hoverFillFor(root.contentForeground, root.contentForeground) : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.03))
+                  borderSpec: Border.controlSpec(isInstalled ? "selected" : "normal", isInstalled ? Color.accent : Qt.darker(root.contentForeground, 2.6), Color.accent)
+
+                  RowLayout {
+                    anchors.fill: parent
+                    anchors.margins: Style.space(10)
+                    spacing: Style.space(10)
+
+                    // Wallpaper Thumbnail Container with local disk caching
+                    Rectangle {
+                      implicitWidth: Style.space(110)
+                      implicitHeight: Style.space(84)
+                      radius: Style.cornerRadius - 1
+                      clip: true
+                      color: Qt.rgba(0,0,0,0.4)
+                      border.width: 1
+                      border.color: Qt.darker(root.contentForeground, 2.5)
+
+                      Image {
+                        anchors.fill: parent
+                        source: {
+                          if (modelData.thumbnail && modelData.thumbnail !== "") {
+                            if (modelData.thumbnail.indexOf("http") === 0 || modelData.thumbnail.indexOf("file://") === 0) return modelData.thumbnail
+                            return "file://" + modelData.thumbnail
+                          }
+                          if (modelData.url && modelData.url !== "") return modelData.url
+                          return ""
+                        }
+                        fillMode: Image.PreserveAspectCrop
+                        asynchronous: true
+                        cache: true
+                      }
+                    }
+
+                    Item {
+                      Layout.fillWidth: true
+                      Layout.fillHeight: true
+
+                      Column {
+                        anchors.fill: parent
+                        spacing: Style.space(3)
+
+                        Row {
+                          width: parent.width
+                          spacing: Style.space(6)
+                          Text {
+                            width: parent.width
+                            textFormat: Text.PlainText
+                            text: modelData.name
+                            font.family: root.contentFontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: true
+                            color: root.contentForeground
+                            maximumLineCount: 2
+                            wrapMode: Text.WordWrap
+                          }
+                          Text {
+                            textFormat: Text.PlainText
+                            text: modelData.category ? ("(" + modelData.category + ")") : ""
+                            font.family: root.contentFontFamily
+                            font.pixelSize: 9
+                            color: root.contentSubtle
+                            elide: Text.ElideRight
+                            maximumLineCount: 1
+                          }
+                        }
+
+                        // 5 Color Swatches from wallpaper palette
+                        Row {
+                          spacing: 4
+                          Repeater {
+                            model: (modelData.colors && modelData.colors.length > 0) ? modelData.colors.slice(0, 5) : ["#7aa2f7", "#1a1b26", "#c0caf5", "#f7768e", "#73daca"]
+
+                            delegate: Rectangle {
+                              required property string modelData
+                              width: 14
+                              height: 14
+                              radius: 3
+                              color: modelData
+                              border.width: 1
+                              border.color: Qt.rgba(0,0,0,0.4)
+                            }
+                          }
+                        }
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: modelData.description
+                          font.family: root.contentFontFamily
+                          font.pixelSize: 9
+                          color: root.contentSubtle
+                          maximumLineCount: 2
+                          wrapMode: Text.WordWrap
+                        }
+                      }
+                    }
+
+                    BorderSurface {
+                      implicitWidth: Style.space(76)
+                      implicitHeight: Style.space(28)
+                      radius: Style.cornerRadius
+                      color: modelData.installed ? Qt.rgba(0.65, 0.89, 0.63, 0.18) : (installMouse.containsMouse ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25) : "transparent")
+                      borderSpec: Border.controlSpec("normal", modelData.installed ? "#10b981" : Color.accent, Color.accent)
+
+                      Text {
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: isBusy ? "Fetching..." : (modelData.installed ? "Installed" : "Download")
+                        font.family: root.contentFontFamily
+                        font.pixelSize: 10
+                        font.bold: true
+                        color: modelData.installed ? "#10b981" : Color.accent
+                      }
+
+                      MouseArea {
+                        id: installMouse
+                        anchors.fill: parent
+                        hoverEnabled: !modelData.installed && !isBusy
+                        cursorShape: (modelData.installed || isBusy) ? Qt.ArrowCursor : Qt.PointingHandCursor
+                        onClicked: {
+                          if (!modelData.installed && !isBusy) {
+                            root.downloadWallpaperTheme(modelData)
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  MouseArea {
+                    id: cardMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
                   }
                 }
               }

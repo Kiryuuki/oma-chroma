@@ -913,6 +913,187 @@ def remove_item(item_type, item_id):
         return False, str(e)
 
 
+
+def build_wallpaper_catalog():
+    """
+    Build wallpaper catalog from the cached wallpapers.js data.
+    Each entry becomes an installable theme-on-demand: the palette is converted
+    into a colors.toml and the wallpaper is downloaded as the background.
+    Cache file is already populated by fetch_and_parse_wallpapers_cached().
+    """
+    if not WALLPAPERS_CACHE_FILE.exists():
+        return []
+    try:
+        with open(WALLPAPERS_CACHE_FILE, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return []
+
+    items = []
+    for it in doc.get("items", []):
+        rel_path = it.get("path", "")
+        if not rel_path:
+            continue
+        raw_name = rel_path.split("/")[-1].split(".")[0].replace("_", " ").replace("-", " ")
+        raw_name = re.sub(r"^\d+x\d+\s+", "", raw_name).strip()
+        clean_name = " ".join(w.capitalize() for w in raw_name.split() if w) if raw_name else rel_path.split("/")[-1]
+
+        theme_id = "wp-" + hashlib.md5(rel_path.encode()).hexdigest()[:10]
+
+        wp_url = it.get("url", "")
+        local_thumb = get_cached_thumbnail_path(wp_url) if wp_url else ""
+
+        items.append({
+            "id": theme_id,
+            "path": rel_path,
+            "name": clean_name,
+            "url": wp_url,
+            "thumbnail": local_thumb,
+            "color": it.get("color", "default"),
+            "colors": it.get("colors", [])[:8],
+            "category": it.get("category", "Curated"),
+            "description": "Wallpaper theme: " + clean_name,
+            "isCdnTheme": True,
+            "colorsTomlUrl": "",
+            "remoteUrl": wp_url,
+            "wallpaperUrl": wp_url,
+            "installed": False
+        })
+    return items
+
+
+def generate_colors_toml_from_palette(colors):
+    """
+    Convert a wallpaper palette (list of hex colors from wallpapers.js) into
+    a colors.toml-compatible dict. Darkest -> background, lightest -> foreground,
+    remaining distributed by hue to accent, green, red, blue, yellow, cyan,
+    magenta, orange.
+    """
+    def brightness(hex_c):
+        h = hex_c.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return (r * 299 + g * 587 + b * 114) / 1000.0
+
+    def hue(hex_c):
+        h = hex_c.lstrip("#")
+        r, g, b = int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0
+        mx, mn = max(r, g, b), min(r, g, b)
+        if mx == mn:
+            return 0.0
+        d = mx - mn
+        if mx == r:
+            h = ((g - b) / d + (6 if g < b else 0)) / 6
+        elif mx == g:
+            h = ((b - r) / d + 2) / 6
+        else:
+            h = ((r - g) / d + 4) / 6
+        return h * 360.0
+
+    if not colors:
+        return {
+            "accent": "#7aa2f7",
+            "background": "#1a1b26",
+            "foreground": "#c0caf5",
+            "green": "#73daca",
+            "red": "#f7768e"
+        }
+
+    by_brightness = sorted(colors, key=lambda c: brightness(c))
+    background = by_brightness[0]
+    foreground = by_brightness[-1]
+    remaining = [c for c in colors if c not in (background, foreground)]
+
+    hue_groups = {"red": [], "yellow": [], "green": [], "cyan": [], "blue": [], "magenta": []}
+    for c in remaining:
+        h = hue(c)
+        if h < 15 or h >= 345:
+            hue_groups["red"].append(c)
+        elif h < 75:
+            hue_groups["yellow"].append(c)
+        elif h < 165:
+            hue_groups["green"].append(c)
+        elif h < 210:
+            hue_groups["cyan"].append(c)
+        elif h < 270:
+            hue_groups["blue"].append(c)
+        else:
+            hue_groups["magenta"].append(c)
+
+    def pick(group):
+        if not group:
+            return None
+        scored = sorted(group, key=lambda c: abs(brightness(c) - 0.4))
+        return scored[0]
+
+    accent = pick(remaining) if remaining else "#7aa2f7"
+    blue = pick(hue_groups["blue"])
+    green = pick(hue_groups["green"])
+    red = pick(hue_groups["red"])
+
+    return {
+        "accent": accent,
+        "background": background,
+        "foreground": foreground,
+        "green": green or "#73daca",
+        "red": red or "#f7768e",
+        "blue": blue or "#7aa2f7",
+        "yellow": pick(hue_groups["yellow"]) or "#e0af68",
+        "cyan": pick(hue_groups["cyan"]) or "#7dcfff",
+        "magenta": pick(hue_groups["magenta"]) or "#bb9af7",
+        "orange": pick([c for c in remaining if 15 <= hue(c) < 45]) or "#ff9e64"
+    }
+
+
+def install_wallpaper_theme(meta):
+    """
+    Install a wallpaper-based theme from wallpapers.js catalog entry.
+    Generates colors.toml from the wallpaper palette and downloads the image.
+    Theme id is derived from the relative path so it stays stable across refreshes.
+    On failure, cleans up any partial install directory.
+    """
+    try:
+        rel_path = meta.get("path", "")
+        theme_id = meta.get("id") or ("wp-" + hashlib.md5(rel_path.encode()).hexdigest()[:10])
+        if not rel_path:
+            return False, "Missing wallpaper path"
+
+        target_dir = Path.home() / ".config" / "omarchy" / "themes" / theme_id
+        if target_dir.exists():
+            return False, "Theme " + theme_id + " already installed."
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        bg_dir = target_dir / "backgrounds"
+        bg_dir.mkdir(parents=True, exist_ok=True)
+
+        colors = meta.get("colors", [])
+        colors_dict = generate_colors_toml_from_palette(colors)
+        colors_lines = []
+        for k, v in colors_dict.items():
+            colors_lines.append(k + ' = "' + v + '"')
+        colors_toml = "\n".join(colors_lines)
+        (target_dir / "colors.toml").write_text(colors_toml + "\n", encoding="utf-8")
+
+        wp_url = meta.get("remoteUrl") or meta.get("url") or ""
+        if wp_url and wp_url.startswith("http"):
+            req = urllib.request.Request(wp_url, headers={"User-Agent": "Mozilla/5.0"})
+            wp_ext = wp_url.rsplit(".", 1)[-1].split("?")[0]
+            if wp_ext not in ("jpg", "jpeg", "png", "webp"):
+                wp_ext = "jpg"
+            wp_file = bg_dir / ("01-wallpaper." + wp_ext)
+            with urllib.request.urlopen(req, timeout=25) as resp, open(wp_file, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            shutil.copy(wp_file, target_dir / ("preview." + wp_ext))
+
+        return True, "Wallpaper theme " + theme_id + " installed successfully."
+    except Exception as e:
+        try:
+            cleanup_dir = Path.home() / ".config" / "omarchy" / "themes" / theme_id
+            if cleanup_dir.exists():
+                shutil.rmtree(cleanup_dir)
+        except Exception:
+            pass
+        return False, str(e)
+
 def install_theme_repo(url, theme_meta=None):
     try:
         url = url.strip()
@@ -1089,6 +1270,13 @@ def poll_status():
         "cursorSources": cursor_sources_with_status
     }
 
+    wallpaper_sources = build_wallpaper_catalog()
+    installed_theme_ids_lower = {t["id"].lower() for t in themes}
+    for ws in wallpaper_sources:
+        ws_id_clean = ws["id"].lower().replace("_", "-")
+        ws["installed"] = any(ws_id_clean in t_id or ws["name"].lower() in t_id for t_id in installed_theme_ids_lower)
+    doc["wallpaperSources"] = wallpaper_sources
+
     write_atomic(STATE_FILE, doc)
     return doc
 
@@ -1145,6 +1333,7 @@ def main():
     parser.add_argument("--next-wallpaper", action="store_true", help="Cycle next wallpaper")
     parser.add_argument("--randomize", choices=["combo", "theme", "cursor", "wallpaper"], help="Randomize styling")
     parser.add_argument("--install-theme", type=str, help="Install theme git URL")
+    parser.add_argument("--install-wallpaper-theme", type=str, help="Install wallpaper theme from JSON metadata")
     parser.add_argument("--install-theme-json", type=str, help="Install theme JSON metadata payload")
     parser.add_argument("--install-cursor", type=str, help="Download & install cursor archive URL")
     parser.add_argument("--remove-item", nargs=2, metavar=("TYPE", "ID"), help="Remove user theme or cursor")
@@ -1267,6 +1456,14 @@ def main():
         try:
             meta = json.loads(args.install_theme_json)
             ok, msg = install_theme_repo(meta.get("url", ""), theme_meta=meta)
+            poll_status()
+            print(json.dumps({"ok": ok, "message": msg}))
+        except Exception as e:
+            print(json.dumps({"ok": False, "message": str(e)}))
+    elif args.install_wallpaper_theme:
+        try:
+            meta = json.loads(args.install_wallpaper_theme)
+            ok, msg = install_wallpaper_theme(meta)
             poll_status()
             print(json.dumps({"ok": ok, "message": msg}))
         except Exception as e:
