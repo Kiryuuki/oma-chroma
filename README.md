@@ -43,6 +43,14 @@ Install directly using the Omarchy Plugin Manager:
 omaplug install kiryuuki.oma-chroma
 ```
 
+## Removal
+
+To uninstall OmaChroma:
+
+```bash
+omaplug remove kiryuuki.oma-chroma
+```
+
 ## Keyboard Shortcuts
 
 | Key | Action |
