@@ -14,6 +14,7 @@ OmaChroma brings a complete styling hub to the Omarchy Quattro shell:
 * **Themes Store**: Real-time theme search, browsing, and installation across 88+ community themes with pre-cached thumbnails and palette displays. Supports adding, editing, and deleting custom Git repositories.
 * **Cursors Store**: Discover curated cursor packages and manage custom release archive links (.tar.xz, .tar.gz, .zip) with inline source management.
 * **Installed Manager**: View, inspect, and remove user-installed themes and cursor packs.
+* **Wallpaper Store**: Browse and install 3000+ wallpapers with auto-generated color themes on demand. Each wallpaper includes palette previews, search, and pagination.
 
 ## Screenshots
 
@@ -21,9 +22,9 @@ OmaChroma brings a complete styling hub to the Omarchy Quattro shell:
 |---|---|
 | ![Themes](assets/preview_tab1_themes.png) | ![Cursors](assets/preview_tab2_cursors.png) |
 
-| Styling Randomizer & Timer | Theme & Cursor Stores |
-|---|---|
-| ![Randomizer](assets/preview_tab3_randomizer.png) | ![Store](assets/preview_tab4_store.png) |
+| Styling Randomizer & Timer | Theme & Cursor Stores | Wallpaper Store |
+|---|---|---|
+| ![Randomizer](assets/preview_tab3_randomizer.png) | ![Store](assets/preview_tab4_store.png) | ![Wallpapers](assets/preview_tab6_wallpapers.png) |
 
 ## Features and Capabilities
 
@@ -51,7 +52,8 @@ omaplug install kiryuuki.oma-chroma
 | `3` | Switch to Randomizer Tab |
 | `4` | Switch to Themes Store Tab |
 | `5` | Switch to Cursors Store Tab |
-| `6` | Switch to Installed Manager Tab |
+|| `6` | Switch to Installed Manager Tab |
+|| `7` | Switch to Wallpaper Store Tab |
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
 | `Enter` / `Space` | Apply selected theme or cursor / Trigger combo roll |
