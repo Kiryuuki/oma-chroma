@@ -12,19 +12,23 @@ Features:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import random
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
-import tarfile
 import zipfile
 
 STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "chroma"
@@ -37,6 +41,283 @@ WALLPAPERS_CACHE_FILE = CACHE_DIR / "wallpapers_cache.json"
 WALLPAPERS_JS_URL = "https://bjarneo.github.io/omarchy-themes/wallpapers.js"
 MAX_STATE_BYTES = 5 * 1024 * 1024  # 5 MB
 CACHE_TTL = 24 * 3600  # 24 hours
+
+# Security & size bounds
+MAX_THUMBNAIL_BYTES = 1 * 1024 * 1024        # 1 MB
+MAX_WALLPAPER_BYTES = 20 * 1024 * 1024       # 20 MB
+MAX_CONFIG_BYTES = 256 * 1024                # 256 KB
+MAX_WALLPAPERS_JS_BYTES = 10 * 1024 * 1024   # 10 MB
+MAX_CURSOR_ARCHIVE_BYTES = 60 * 1024 * 1024  # 60 MB
+MAX_ARCHIVE_ENTRIES = 1000
+MAX_DECOMPRESSED_ARCHIVE_BYTES = 60 * 1024 * 1024
+
+# Pinned trust model allowlists
+TRUSTED_GIT_HOSTS = {"github.com", "gitlab.com"}
+TRUSTED_CDN_HOSTS = {
+    "bjarneo.github.io",
+    "wallpapers.hel1.your-objectstorage.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+    "gitlab.com",
+}
+
+SAFE_ID_REGEX = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
+GIT_REPO_REGEX = re.compile(
+    r"^https://(?:www\.)?(github\.com|gitlab\.com)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+
+
+def validate_safe_identifier(identifier: str) -> str:
+    """Validates that an identifier matches safe alphanumeric/dash/underscore syntax with no path traversal."""
+    ident = (identifier or "").strip()
+    if not ident or not SAFE_ID_REGEX.match(ident) or ".." in ident or "/" in ident or "\\" in ident:
+        raise ValueError(
+            f"Invalid or unsafe identifier '{identifier}'. Must be 1-64 characters alphanumeric, dash, dot, or underscore."
+        )
+    return ident
+
+
+def is_safe_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Returns True if IP address is public and safe (not loopback, private, link-local, multicast, etc.)."""
+    return not (
+        ip_obj.is_loopback
+        or ip_obj.is_private
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def is_safe_public_url(url: str, allow_custom_hosts: bool = True) -> tuple[bool, str]:
+    """
+    Validates that a URL:
+    - Strictly uses HTTPS
+    - Has a valid, non-empty hostname
+    - Does not target loopback, private RFC 1918, link-local, or multicast IPs (anti-SSRF)
+    - If allow_custom_hosts is False, hostname must be in TRUSTED_CDN_HOSTS
+    """
+    try:
+        url = (url or "").strip()
+        if not url:
+            return False, "URL cannot be empty."
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https":
+            return False, f"Insecure URL scheme '{parsed.scheme}'. Only https:// is permitted."
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            return False, "URL missing valid hostname."
+
+        if not allow_custom_hosts:
+            if host not in TRUSTED_CDN_HOSTS and not any(host.endswith("." + th) for th in TRUSTED_CDN_HOSTS):
+                return False, f"Host '{host}' is not in the trusted host allowlist."
+
+        # SSRF checks: first test if host is literal IP
+        try:
+            ip = ipaddress.ip_address(host.strip("[]"))
+            if not is_safe_ip(ip):
+                return False, f"URL targets disallowed non-public IP address '{host}'."
+        except ValueError:
+            # Resolve hostname via DNS to prevent DNS rebinding / internal network scanning
+            try:
+                addr_info = socket.getaddrinfo(host, parsed.port or 443, proto=socket.IPPROTO_TCP)
+                if not addr_info:
+                    return False, f"Unable to resolve hostname '{host}'."
+                for family, socktype, proto, canonname, sockaddr in addr_info:
+                    ip_str = sockaddr[0]
+                    ip = ipaddress.ip_address(ip_str)
+                    if not is_safe_ip(ip):
+                        return False, f"Host '{host}' resolves to non-public/disallowed IP '{ip_str}'."
+            except Exception as e:
+                return False, f"DNS resolution failed for '{host}': {e}"
+
+        return True, ""
+    except Exception as e:
+        return False, f"URL validation error: {e}"
+
+
+class SafeChromaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Ensures that HTTP redirects adhere to safe public HTTPS anti-SSRF policy."""
+    def __init__(self, allow_custom_hosts: bool = True):
+        super().__init__()
+        self.allow_custom_hosts = allow_custom_hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved_url = urllib.parse.urljoin(req.full_url, newurl)
+        ok, err = is_safe_public_url(resolved_url, allow_custom_hosts=self.allow_custom_hosts)
+        if not ok:
+            raise urllib.error.HTTPError(resolved_url, code, f"Redirect rejected: {err}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_stream_bounded(
+    url: str,
+    target_path: Path | None = None,
+    max_bytes: int = MAX_WALLPAPER_BYTES,
+    timeout: float = 30.0,
+    allow_custom_hosts: bool = True,
+) -> bytes:
+    """
+    Downloads content over HTTPS with:
+    - Pre-flight and per-redirect SSRF / scheme / host validation
+    - Content-Length pre-check against byte ceiling
+    - Chunked stream reading with strict runtime upper byte ceiling
+    - If target_path is provided, writes directly to file atomically with automatic cleanup on failure
+    - Returns bytes if target_path is None
+    """
+    ok, err = is_safe_public_url(url, allow_custom_hosts=allow_custom_hosts)
+    if not ok:
+        raise ValueError(err)
+
+    opener = urllib.request.build_opener(SafeChromaRedirectHandler(allow_custom_hosts=allow_custom_hosts))
+    req = urllib.request.Request(url, headers={"User-Agent": "omarchy-chroma/1.1"})
+
+    with opener.open(req, timeout=timeout) as resp:
+        final_url = resp.geturl()
+        final_ok, final_err = is_safe_public_url(final_url, allow_custom_hosts=allow_custom_hosts)
+        if not final_ok:
+            raise ValueError(f"Final URL rejected: {final_err}")
+
+        cl = resp.headers.get("Content-Length")
+        if cl and cl.isdigit() and int(cl) > max_bytes:
+            raise ValueError(f"Remote Content-Length {cl} exceeds maximum limit of {max_bytes} bytes")
+
+        total = 0
+        chunk_size = 32768
+        if target_path:
+            p = Path(target_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            handle, temp_name = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+            try:
+                with os.fdopen(handle, "wb") as f:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError(f"Download size exceeded maximum limit of {max_bytes} bytes")
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_name, p)
+                return b""
+            except BaseException:
+                Path(temp_name).unlink(missing_ok=True)
+                raise
+        else:
+            chunks = []
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Download size exceeded maximum limit of {max_bytes} bytes")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+
+def safe_extract_archive(
+    archive_path: Path,
+    extract_dir: Path,
+    max_entries: int = MAX_ARCHIVE_ENTRIES,
+    max_decompressed_bytes: int = MAX_DECOMPRESSED_ARCHIVE_BYTES,
+) -> None:
+    """
+    Safely extracts tar or zip archive enforcing:
+    - Path containment inside extract_dir (Zip Slip defense)
+    - Rejection of absolute paths or '..' path segments
+    - Rejection of symlinks, hardlinks, character devices, block devices, and FIFOs
+    - Maximum member count ceiling
+    - Maximum total uncompressed byte ceiling
+    """
+    resolved_extract = extract_dir.resolve()
+
+    if zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            infolist = zf.infolist()
+            if len(infolist) > max_entries:
+                raise ValueError(f"Archive entry count ({len(infolist)}) exceeds limit ({max_entries}).")
+
+            total_bytes = 0
+            for info in infolist:
+                total_bytes += info.file_size
+                if total_bytes > max_decompressed_bytes:
+                    raise ValueError(f"Decompressed archive size exceeds ceiling ({max_decompressed_bytes} bytes).")
+
+                if info.filename.startswith("/") or ".." in Path(info.filename).parts:
+                    raise ValueError(f"Zip Slip / Path traversal attempt detected: {info.filename}")
+
+                target = (extract_dir / info.filename).resolve()
+                if not target.is_relative_to(resolved_extract):
+                    raise ValueError(f"Archive member path escapes destination: {info.filename}")
+
+                mode = info.external_attr >> 16
+                if mode and (stat.S_ISLNK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode) or stat.S_ISFIFO(mode)):
+                    raise ValueError(f"Unsafe archive member type in {info.filename}")
+
+            for info in infolist:
+                target = (extract_dir / info.filename).resolve()
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+
+    elif tarfile.is_tarfile(archive_path):
+        with tarfile.open(archive_path, "r:*") as tar:
+            members = tar.getmembers()
+            if len(members) > max_entries:
+                raise ValueError(f"Archive entry count ({len(members)}) exceeds limit ({max_entries}).")
+
+            total_bytes = 0
+            for m in members:
+                total_bytes += m.size
+                if total_bytes > max_decompressed_bytes:
+                    raise ValueError(f"Decompressed archive size exceeds ceiling ({max_decompressed_bytes} bytes).")
+
+                if m.name.startswith("/") or ".." in Path(m.name).parts:
+                    raise ValueError(f"Tar traversal attempt detected: {m.name}")
+
+                target = (extract_dir / m.name).resolve()
+                if not target.is_relative_to(resolved_extract):
+                    raise ValueError(f"Tar member path escapes destination: {m.name}")
+
+                if m.issym() or m.islnk() or m.isdev() or m.ischr() or m.isfifo():
+                    raise ValueError(f"Unsafe tar member type (symlink, hardlink, or device): {m.name}")
+
+            for m in members:
+                target = (extract_dir / m.name).resolve()
+                if m.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif m.isreg():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with tar.extractfile(m) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+    else:
+        raise ValueError("Downloaded file is not a supported tar or zip archive.")
+
+
+def verify_directory_safety(dir_path: Path) -> None:
+    """Verifies that all files within dir_path are contained and contain no symlinks escaping dir_path."""
+    resolved_dir = dir_path.resolve()
+    for root, dirs, files in os.walk(resolved_dir):
+        for name in dirs + files:
+            entry_path = Path(root) / name
+            try:
+                st = entry_path.lstat()
+                if stat.S_ISLNK(st.st_mode):
+                    target = entry_path.resolve()
+                    if not target.is_relative_to(resolved_dir):
+                        raise ValueError(f"Symlink {entry_path.name} escapes theme directory: -> {target}")
+                elif not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                    raise ValueError(f"Special file type detected in repository: {entry_path.name}")
+            except Exception as e:
+                raise ValueError(f"Safety check failed for {entry_path.name}: {e}")
 
 REPO_BACKGROUND_MAP = {
     "JJDizz1L/aetheria": "https://raw.githubusercontent.com/JJDizz1L/aetheria/omarchy-aetheria-theme/backgrounds/aetheria-1-4k%40.jpg",
@@ -273,9 +554,13 @@ def fetch_and_parse_wallpapers_cached():
 
     # 2. Fetch live data from upstream CDN
     try:
-        req = urllib.request.Request(WALLPAPERS_JS_URL, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
-            raw_text = resp.read().decode("utf-8")
+        raw_bytes = download_stream_bounded(
+            WALLPAPERS_JS_URL,
+            max_bytes=MAX_WALLPAPERS_JS_BYTES,
+            timeout=20.0,
+            allow_custom_hosts=False,
+        )
+        raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
         # Extract WALLPAPERS_BASE_URL via regex
         m = re.search(r'window\.WALLPAPERS_BASE_URL\s*=\s*"([^"]+)"', raw_text)
@@ -401,22 +686,26 @@ def get_cached_thumbnail_path(remote_url):
 
 
 def prefetch_thumbnails(urls, limit=30):
-    """Prefetches and caches thumbnails for snappy local display."""
+    """Prefetches and caches thumbnails for snappy local display with bounded download size."""
     THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
     count = 0
     for u in urls:
-        if count >= limit or not u or not u.startswith("http"):
+        if count >= limit or not u or not u.startswith("https://"):
             continue
         h = hashlib.sha256(u.encode("utf-8")).hexdigest()[:16]
-        ext = u.split(".")[-1].split("?")[0]
+        ext = u.split(".")[-1].split("?")[0].lower()
         if ext not in ("jpg", "jpeg", "png", "webp"):
             ext = "jpg"
         target = THUMBNAIL_DIR / f"thumb_{h}.{ext}"
         if not target.exists() or target.stat().st_size < 500:
             try:
-                req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=3.0) as resp, open(target, "wb") as out_f:
-                    shutil.copyfileobj(resp, out_f)
+                download_stream_bounded(
+                    u,
+                    target_path=target,
+                    max_bytes=MAX_THUMBNAIL_BYTES,
+                    timeout=5.0,
+                    allow_custom_hosts=True,
+                )
                 count += 1
             except Exception:
                 pass
@@ -756,17 +1045,31 @@ def add_custom_source(name, url, desc="", src_type="theme"):
     cfg = load_config()
     key = "customCursorSources" if src_type == "cursor" else "customSources"
     sources = cfg.get(key, [])
-    url = url.strip()
+    url = (url or "").strip()
     if not url:
-        return False, "URL cannot be empty"
-    
+        return False, "URL cannot be empty."
+
+    if src_type == "theme":
+        if not GIT_REPO_REGEX.match(url):
+            return False, "Theme source must be an HTTPS Git URL from github.com or gitlab.com."
+    elif src_type == "cursor":
+        ok, err = is_safe_public_url(url, allow_custom_hosts=True)
+        if not ok:
+            return False, f"Invalid cursor archive URL: {err}"
+
+    name = re.sub(r'[\x00-\x1f\x7f]', '', str(name or "")).strip()[:100]
+    desc = re.sub(r'[\x00-\x1f\x7f]', '', str(desc or "")).strip()[:300]
+
     for s in sources:
         if s.get("url") == url:
-            s["name"] = name
-            s["description"] = desc
+            s["name"] = name or s.get("name")
+            s["description"] = desc or s.get("description")
             save_config(cfg)
             Path(ONLINE_THEMES_CACHE).unlink(missing_ok=True)
             return True, f"Updated existing {src_type} source."
+
+    if len(sources) >= 100:
+        return False, f"Maximum number of custom {src_type} sources (100) reached."
 
     sources.append({
         "id": ("src-cur-" if src_type == "cursor" else "src-") + hashlib.md5(url.encode()).hexdigest()[:8],
@@ -797,10 +1100,23 @@ def edit_custom_source(src_id, new_name, new_url, src_type="theme"):
     cfg = load_config()
     key = "customCursorSources" if src_type == "cursor" else "customSources"
     sources = cfg.get(key, [])
+    new_url = (new_url or "").strip()
+    if not new_url:
+        return False, "URL cannot be empty."
+
+    if src_type == "theme":
+        if not GIT_REPO_REGEX.match(new_url):
+            return False, "Theme source must be an HTTPS Git URL from github.com or gitlab.com."
+    elif src_type == "cursor":
+        ok, err = is_safe_public_url(new_url, allow_custom_hosts=True)
+        if not ok:
+            return False, f"Invalid cursor archive URL: {err}"
+
+    new_name = re.sub(r'[\x00-\x1f\x7f]', '', str(new_name or "")).strip()[:100]
     found = False
     for s in sources:
         if s.get("id") == src_id:
-            s["name"] = new_name
+            s["name"] = new_name or s.get("name")
             s["url"] = new_url
             found = True
             break
@@ -896,19 +1212,28 @@ def next_wallpaper():
 
 def remove_item(item_type, item_id):
     try:
+        clean_id = validate_safe_identifier(item_id)
         if item_type == "theme":
-            target = Path.home() / ".config" / "omarchy" / "themes" / item_id
+            themes_base = (Path.home() / ".config" / "omarchy" / "themes").resolve()
+            target = (themes_base / clean_id).resolve()
+            if not target.is_relative_to(themes_base) or target == themes_base:
+                return False, "Path traversal rejected in theme removal."
             if target.exists():
                 shutil.rmtree(target)
-                return True, f"Theme {item_id} removed."
-            res = subprocess.run(["omarchy", "theme", "remove", item_id], capture_output=True, text=True, timeout=5.0)
+                return True, f"Theme {clean_id} removed."
+            res = subprocess.run(["omarchy", "theme", "remove", clean_id], capture_output=True, text=True, timeout=5.0)
             return res.returncode == 0, res.stdout + res.stderr
         elif item_type == "cursor":
-            for base in [Path.home() / ".local" / "share" / "icons" / item_id, Path.home() / ".icons" / item_id]:
-                if base.exists():
-                    shutil.rmtree(base)
-                    return True, f"Cursor pack {item_id} removed."
+            for base_dir in [Path.home() / ".local" / "share" / "icons", Path.home() / ".icons"]:
+                resolved_base = base_dir.resolve()
+                target = (resolved_base / clean_id).resolve()
+                if not target.is_relative_to(resolved_base) or target == resolved_base:
+                    continue
+                if target.exists():
+                    shutil.rmtree(target)
+                    return True, f"Cursor pack {clean_id} removed."
             return False, "Cursor pack not found in user directory."
+        return False, f"Unknown item type '{item_type}'."
     except Exception as e:
         return False, str(e)
 
@@ -1049,17 +1374,22 @@ def install_wallpaper_theme(meta):
     Install a wallpaper-based theme from wallpapers.js catalog entry.
     Generates colors.toml from the wallpaper palette and downloads the image.
     Theme id is derived from the relative path so it stays stable across refreshes.
-    On failure, cleans up any partial install directory.
+    On failure, cleans up any partial install directory with resolved containment.
     """
+    theme_id = ""
+    themes_base = (Path.home() / ".config" / "omarchy" / "themes").resolve()
     try:
         rel_path = meta.get("path", "")
-        theme_id = meta.get("id") or ("wp-" + hashlib.md5(rel_path.encode()).hexdigest()[:10])
+        raw_id = meta.get("id") or ("wp-" + hashlib.md5(rel_path.encode()).hexdigest()[:10])
+        theme_id = validate_safe_identifier(raw_id)
         if not rel_path:
             return False, "Missing wallpaper path"
 
-        target_dir = Path.home() / ".config" / "omarchy" / "themes" / theme_id
+        target_dir = (themes_base / theme_id).resolve()
+        if not target_dir.is_relative_to(themes_base) or target_dir == themes_base:
+            return False, "Invalid theme destination directory."
         if target_dir.exists():
-            return False, "Theme " + theme_id + " already installed."
+            return False, f"Theme {theme_id} already installed."
 
         target_dir.mkdir(parents=True, exist_ok=True)
         bg_dir = target_dir / "backgrounds"
@@ -1069,113 +1399,158 @@ def install_wallpaper_theme(meta):
         colors_dict = generate_colors_toml_from_palette(colors)
         colors_lines = []
         for k, v in colors_dict.items():
-            colors_lines.append(k + ' = "' + v + '"')
+            colors_lines.append(f'{k} = "{v}"')
         colors_toml = "\n".join(colors_lines)
         (target_dir / "colors.toml").write_text(colors_toml + "\n", encoding="utf-8")
 
         wp_url = meta.get("remoteUrl") or meta.get("url") or ""
-        if wp_url and wp_url.startswith("http"):
-            req = urllib.request.Request(wp_url, headers={"User-Agent": "Mozilla/5.0"})
-            wp_ext = wp_url.rsplit(".", 1)[-1].split("?")[0]
+        if wp_url and wp_url.startswith("https://"):
+            wp_ext = wp_url.rsplit(".", 1)[-1].split("?")[0].lower()
             if wp_ext not in ("jpg", "jpeg", "png", "webp"):
                 wp_ext = "jpg"
-            wp_file = bg_dir / ("01-wallpaper." + wp_ext)
-            with urllib.request.urlopen(req, timeout=25) as resp, open(wp_file, "wb") as f:
-                shutil.copyfileobj(resp, f)
-            shutil.copy(wp_file, target_dir / ("preview." + wp_ext))
+            wp_file = bg_dir / f"01-wallpaper.{wp_ext}"
+            download_stream_bounded(
+                wp_url,
+                target_path=wp_file,
+                max_bytes=MAX_WALLPAPER_BYTES,
+                timeout=30.0,
+                allow_custom_hosts=False,
+            )
+            shutil.copy(wp_file, target_dir / f"preview.{wp_ext}")
 
-        return True, "Wallpaper theme " + theme_id + " installed successfully."
+        return True, f"Wallpaper theme {theme_id} installed successfully."
     except Exception as e:
         try:
-            cleanup_dir = Path.home() / ".config" / "omarchy" / "themes" / theme_id
-            if cleanup_dir.exists():
-                shutil.rmtree(cleanup_dir)
+            if theme_id:
+                clean_id = validate_safe_identifier(theme_id)
+                cleanup_dir = (themes_base / clean_id).resolve()
+                if cleanup_dir.is_relative_to(themes_base) and cleanup_dir != themes_base and cleanup_dir.exists():
+                    shutil.rmtree(cleanup_dir)
         except Exception:
             pass
         return False, str(e)
 
+
 def install_theme_repo(url, theme_meta=None):
     try:
-        url = url.strip()
-        if not url:
-            return False, "Theme URL or metadata cannot be empty"
+        url = (url or "").strip()
+        themes_base = (Path.home() / ".config" / "omarchy" / "themes").resolve()
+        themes_base.mkdir(parents=True, exist_ok=True)
 
-        # Check if this is a direct bjarneo / cdn theme or regular git repo
+        # Check if this is a direct bjarneo / cdn theme
         if theme_meta and theme_meta.get("isCdnTheme") and theme_meta.get("colorsTomlUrl"):
-            theme_id = theme_meta.get("id", "custom-theme")
-            target_dir = Path.home() / ".config" / "omarchy" / "themes" / theme_id
+            raw_id = theme_meta.get("id", "custom-theme")
+            theme_id = validate_safe_identifier(raw_id)
+            target_dir = (themes_base / theme_id).resolve()
+            if not target_dir.is_relative_to(themes_base) or target_dir == themes_base:
+                return False, "Invalid theme destination directory."
             if target_dir.exists():
                 return False, f"Theme directory {theme_id} already exists."
-            
+
             target_dir.mkdir(parents=True, exist_ok=True)
             bg_dir = target_dir / "backgrounds"
             bg_dir.mkdir(parents=True, exist_ok=True)
 
-            # Download colors.toml
+            # Download colors.toml from verified CDN
             colors_url = theme_meta.get("colorsTomlUrl")
-            req = urllib.request.Request(colors_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp, open(target_dir / "colors.toml", "wb") as f:
-                f.write(resp.read())
+            download_stream_bounded(
+                colors_url,
+                target_path=target_dir / "colors.toml",
+                max_bytes=MAX_CONFIG_BYTES,
+                timeout=15.0,
+                allow_custom_hosts=False,
+            )
 
-            # Download wallpaper
+            # Download wallpaper from verified CDN
             wp_url = theme_meta.get("remoteUrl") or theme_meta.get("wallpaperUrl")
-            if wp_url and wp_url.startswith("http"):
-                req2 = urllib.request.Request(wp_url, headers={"User-Agent": "Mozilla/5.0"})
-                wp_ext = wp_url.split(".")[-1].split("?")[0]
+            if wp_url and wp_url.startswith("https://"):
+                wp_ext = wp_url.split(".")[-1].split("?")[0].lower()
                 if wp_ext not in ("jpg", "jpeg", "png", "webp"):
                     wp_ext = "jpg"
                 wp_file = bg_dir / f"01-wallpaper.{wp_ext}"
-                with urllib.request.urlopen(req2, timeout=25) as resp, open(wp_file, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                download_stream_bounded(
+                    wp_url,
+                    target_path=wp_file,
+                    max_bytes=MAX_WALLPAPER_BYTES,
+                    timeout=30.0,
+                    allow_custom_hosts=False,
+                )
                 shutil.copy(wp_file, target_dir / f"preview.{wp_ext}")
 
-            return True, f"Theme {theme_id} installed successfully from Bjarneo CDN."
+            return True, f"Theme {theme_id} installed successfully from verified CDN."
 
-        if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("git@"):
-            return False, "Invalid repository URL format"
+        # Pinned Trust Model for Git repository clone
+        if not url:
+            return False, "Repository URL cannot be empty."
 
-        repo_name = url.rstrip("/").split("/")[-1]
-        if repo_name.endswith(".git"):
-            repo_name = repo_name[:-4]
+        m = GIT_REPO_REGEX.match(url)
+        if not m:
+            return False, "Only HTTPS Git URLs from trusted hosts (github.com, gitlab.com) are permitted."
 
-        target_dir = Path.home() / ".config" / "omarchy" / "themes" / repo_name
+        host = m.group(1).lower()
+        owner = m.group(2)
+        raw_repo_name = m.group(3)
+
+        repo_name = validate_safe_identifier(raw_repo_name)
+        target_dir = (themes_base / repo_name).resolve()
+        if not target_dir.is_relative_to(themes_base) or target_dir == themes_base:
+            return False, "Invalid repository destination path."
+
         if target_dir.exists():
             return False, f"Theme directory {repo_name} already exists."
 
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        res = subprocess.run(["git", "clone", "--depth", "1", url, str(target_dir)], capture_output=True, text=True, timeout=30.0)
-        if res.returncode == 0:
-            return True, f"Theme {repo_name} installed successfully."
-        return False, res.stderr
+        # Clone strictly via HTTPS from validated host
+        canonical_git_url = f"https://{host}/{owner}/{raw_repo_name}.git"
+        res = subprocess.run(
+            ["git", "clone", "--depth", "1", canonical_git_url, str(target_dir)],
+            capture_output=True,
+            text=True,
+            timeout=45.0,
+        )
+        if res.returncode != 0:
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            return False, f"Git clone failed: {res.stderr.strip()}"
+
+        # Post-clone directory integrity and symlink escape verification
+        try:
+            verify_directory_safety(target_dir)
+        except Exception as e:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return False, f"Cloned repository failed safety verification: {e}"
+
+        return True, f"Theme {repo_name} installed successfully."
     except Exception as e:
         return False, str(e)
 
 
 def install_cursor_archive(url):
     try:
-        url = url.strip()
-        dest_base = Path.home() / ".local" / "share" / "icons"
+        url = (url or "").strip()
+        dest_base = (Path.home() / ".local" / "share" / "icons").resolve()
         dest_base.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             archive_path = tmp_path / "downloaded_cursor"
 
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
-            with urllib.request.urlopen(req, timeout=45.0) as resp, open(archive_path, "wb") as out_file:
-                shutil.copyfileobj(resp, out_file)
+            download_stream_bounded(
+                url,
+                target_path=archive_path,
+                max_bytes=MAX_CURSOR_ARCHIVE_BYTES,
+                timeout=45.0,
+                allow_custom_hosts=True,
+            )
 
             extract_dir = tmp_path / "extracted"
             extract_dir.mkdir()
 
-            if tarfile.is_tarfile(archive_path):
-                with tarfile.open(archive_path, "r:*") as tar:
-                    tar.extractall(path=extract_dir)
-            elif zipfile.is_zipfile(archive_path):
-                with zipfile.ZipFile(archive_path, "r") as zf:
-                    zf.extractall(path=extract_dir)
-            else:
-                return False, "Downloaded file is not a supported tar or zip archive."
+            safe_extract_archive(
+                archive_path,
+                extract_dir,
+                max_entries=MAX_ARCHIVE_ENTRIES,
+                max_decompressed_bytes=MAX_DECOMPRESSED_ARCHIVE_BYTES,
+            )
 
             installed = []
             for root, dirs, files in os.walk(extract_dir):
@@ -1183,11 +1558,13 @@ def install_cursor_archive(url):
                     src_theme_dir = Path(root)
                     theme_name = src_theme_dir.name
                     if theme_name != "extracted":
-                        target = dest_base / theme_name
-                        if target.exists():
-                            shutil.rmtree(target)
-                        shutil.copytree(src_theme_dir, target)
-                        installed.append(theme_name)
+                        clean_name = validate_safe_identifier(theme_name)
+                        target = (dest_base / clean_name).resolve()
+                        if target.is_relative_to(dest_base) and target != dest_base:
+                            if target.exists():
+                                shutil.rmtree(target)
+                            shutil.copytree(src_theme_dir, target)
+                            installed.append(clean_name)
 
             if installed:
                 return True, f"Installed cursors: {', '.join(installed)}"
